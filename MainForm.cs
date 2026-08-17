@@ -143,6 +143,7 @@ public class Card : Control
 public class CaptionButton : Control
 {
     public bool IsClose { get; set; }
+    public bool IsMaximize { get; set; }
     private bool _hover, _down;
 
     public CaptionButton()
@@ -170,6 +171,21 @@ public class CaptionButton : Control
             e.Graphics.DrawLine(pen, cx - hw, cy - hw, cx + hw, cy + hw);
             e.Graphics.DrawLine(pen, cx - hw, cy + hw, cx + hw, cy - hw);
         }
+        else if (IsMaximize)
+        {
+            bool max = (FindForm()?.WindowState ?? FormWindowState.Normal) == FormWindowState.Maximized;
+            if (max)
+            {
+                // 还原：两个错位方块
+                e.Graphics.DrawRectangle(pen, cx - 6, cy - 2, 8, 8);
+                e.Graphics.DrawRectangle(pen, cx - 2, cy - 6, 8, 8);
+            }
+            else
+            {
+                // 最大化：单个方块
+                e.Graphics.DrawRectangle(pen, cx - 5, cy - 5, 10, 10);
+            }
+        }
         else
         {
             e.Graphics.DrawLine(pen, cx - hw, cy + 2, cx + hw, cy + 2);
@@ -189,6 +205,7 @@ public class MainForm : Form
     private Card overlayCard = null!;
     private Label lblStatus = null!, lblDetail = null!;
     private PillButton btnRetry = null!, btnLogs = null!, btnQuit = null!;
+    private CaptionButton btnMin = null!, btnMax = null!, btnClose = null!;
     private bool _webReady;
     private bool _starting = true;
     private bool _reallyExit;            // 托盘菜单触发真正退出
@@ -201,7 +218,11 @@ public class MainForm : Form
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
     private const int WM_NCHITTEST = 0x84;
+    private const int WM_NCLBUTTONDBLCLK = 0xA3;
     private const int HTCAPTION = 2;
+    private const int HTLEFT = 10, HTRIGHT = 11, HTTOP = 12, HTTOPLEFT = 13, HTTOPRIGHT = 14;
+    private const int HTBOTTOM = 15, HTBOTTOMLEFT = 16, HTBOTTOMRIGHT = 17;
+    private const int EdgeResize = 8;            // 边缘拖拽缩放宽度
 
     public MainForm()
     {
@@ -221,6 +242,8 @@ public class MainForm : Form
         {
             int cp = 2; // Win11 圆角窗口
             DwmSetWindowAttribute(Handle, 33, ref cp, 4);
+            // 最大化时占满工作区（不遮挡任务栏）
+            try { MaximizedBounds = Screen.FromHandle(Handle).WorkingArea; } catch { }
         };
 
         BuildLayout();
@@ -230,11 +253,47 @@ public class MainForm : Form
 
     protected override void WndProc(ref Message m)
     {
+        if (m.Msg == Program.WmDshShow)
+        {
+            ShowMain(); // 第二个实例启动时，把已有窗口带到前台
+            return;
+        }
+        if (m.Msg == WM_NCLBUTTONDBLCLK)
+        {
+            // 双击标题栏：切换最大化/还原
+            int lp = m.LParam.ToInt32();
+            short x = (short)(lp & 0xFFFF), y = (short)(lp >> 16);
+            var pt = PointToClient(new Point(x, y));
+            if (pt.Y >= 0 && pt.Y < TITLE_H) { ToggleMaximize(); return; }
+        }
         if (m.Msg == WM_NCHITTEST)
         {
             int lp = m.LParam.ToInt32();
             short x = (short)(lp & 0xFFFF), y = (short)(lp >> 16);
             var pt = PointToClient(new Point(x, y));
+
+            if (WindowState == FormWindowState.Maximized)
+            {
+                if (pt.Y < TITLE_H) { m.Result = (IntPtr)HTCAPTION; return; }
+                base.WndProc(ref m);
+                return;
+            }
+
+            // 边缘拖拽缩放
+            int w = Width, h = Height;
+            if (pt.Y < EdgeResize)
+            {
+                m.Result = (IntPtr)(pt.X < EdgeResize ? HTTOPLEFT : pt.X >= w - EdgeResize ? HTTOPRIGHT : HTTOP);
+                return;
+            }
+            if (pt.Y >= h - EdgeResize)
+            {
+                m.Result = (IntPtr)(pt.X < EdgeResize ? HTBOTTOMLEFT : pt.X >= w - EdgeResize ? HTBOTTOMRIGHT : HTBOTTOM);
+                return;
+            }
+            if (pt.X < EdgeResize) { m.Result = (IntPtr)HTLEFT; return; }
+            if (pt.X >= w - EdgeResize) { m.Result = (IntPtr)HTRIGHT; return; }
+
             if (pt.Y < TITLE_H)
             {
                 m.Result = (IntPtr)HTCAPTION;
@@ -265,11 +324,13 @@ public class MainForm : Form
             BackColor = C.Win,
             Font = new Font("Segoe UI Semibold", 10.5f)
         };
-        var btnMin = new CaptionButton { Location = new Point(ClientSize.Width - 96, 8) };
-        var btnClose = new CaptionButton { IsClose = true, Location = new Point(ClientSize.Width - 46, 8) };
+        btnMin = new CaptionButton { Location = new Point(ClientSize.Width - 142, 8) };
+        btnMax = new CaptionButton { IsMaximize = true, Location = new Point(ClientSize.Width - 96, 8) };
+        btnClose = new CaptionButton { IsClose = true, Location = new Point(ClientSize.Width - 46, 8) };
         btnMin.Click += (s, e) => WindowState = FormWindowState.Minimized;
+        btnMax.Click += (s, e) => ToggleMaximize();
         btnClose.Click += (s, e) => HideToTray();
-        Controls.AddRange(new Control[] { pic, title, btnMin, btnClose });
+        Controls.AddRange(new Control[] { pic, title, btnMin, btnMax, btnClose });
 
         // WebView2 全区域
         webView = new WebView2
@@ -335,6 +396,25 @@ public class MainForm : Form
         int cx = Math.Max(0, (overlay.Width - overlayCard.Width) / 2);
         int cy = Math.Max(0, (overlay.Height - overlayCard.Height) / 2);
         overlayCard.Location = new Point(cx, cy);
+    }
+
+    /// <summary>窗口大小变化时，把标题栏按钮钉在右上角。</summary>
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (btnMin == null) return;
+        int w = ClientSize.Width;
+        btnMin.Location = new Point(w - 142, 8);
+        btnMax.Location = new Point(w - 96, 8);
+        btnClose.Location = new Point(w - 46, 8);
+        btnMin.Invalidate(); btnMax.Invalidate(); btnClose.Invalidate();
+    }
+
+    private void ToggleMaximize()
+    {
+        WindowState = WindowState == FormWindowState.Maximized
+            ? FormWindowState.Normal
+            : FormWindowState.Maximized;
     }
 
     private void BuildTray()
@@ -420,11 +500,20 @@ public class MainForm : Form
 
     private async Task NavigateAsync()
     {
-        // 等待 WebView2 初始化完成（最多 15 秒）
-        for (int i = 0; i < 150 && !_webReady; i++)
-            await Task.Delay(100);
-        if (_webReady)
+        try
+        {
+            if (!_webReady)
+            {
+                // WebView2 不会自动初始化，必须显式调用（此前缺失导致 WebUI 永远加载不出来）
+                await webView.EnsureCoreWebView2Async();
+                _webReady = true;
+            }
             webView.CoreWebView2?.Navigate(DshService.Url);
+        }
+        catch (Exception ex)
+        {
+            BeginInvoke(() => ShowError(DshService.StartResult.Failed("WebView2 初始化失败：" + ex.Message)));
+        }
     }
 
     private void ShowError(DshService.StartResult result)
